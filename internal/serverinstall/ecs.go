@@ -46,6 +46,8 @@ const (
 	defaultRunnerTagValue = "runner-component"
 )
 
+var prefix string = ""
+
 type ECSInstaller struct {
 	config ecsConfig
 }
@@ -72,8 +74,12 @@ type ecsConfig struct {
 
 	// CPU configures the default amount of CPU for the task
 	CPU string `hcl:"cpu,optional"`
+
 	// Memory configures the default amount of memory for the task
 	Memory string `hcl:"memory,optional"`
+
+	// Name preifx for AWS resources
+	Prefix string `hcl:"prefix,optional"`
 }
 
 // Install is a method of ECSInstaller and implements the Installer interface to
@@ -96,6 +102,9 @@ func (i *ECSInstaller) Install(
 
 		err error
 	)
+	if i.config.Prefix != "" {
+		prefix = i.config.Prefix + "-"
+	}
 
 	lf := &Lifecycle{
 		Init: func(ui terminal.UI) error {
@@ -123,7 +132,7 @@ func (i *ECSInstaller) Install(
 				return err
 			}
 
-			if serverLogGroup, err = i.SetupLogs(ctx, ui, log, sess, defaultServerLogGroup); err != nil {
+			if serverLogGroup, err = i.SetupLogs(ctx, ui, log, sess, prefix+defaultServerLogGroup); err != nil {
 				return err
 			}
 
@@ -221,7 +230,7 @@ func (i *ECSInstaller) Launch(
 	def := ecs.ContainerDefinition{
 		Essential: aws.Bool(true),
 		Command:   cmd,
-		Name:      aws.String(serverName),
+		Name:      aws.String(prefix + serverName),
 		Image:     aws.String(i.config.ServerImage),
 		PortMappings: []*ecs.PortMapping{
 			{
@@ -247,14 +256,14 @@ func (i *ECSInstaller) Launch(
 	// existin in a 1:1 pair with the subnets in use.
 	log.Debug("registering task definition")
 
-	s.Update("Registering Task definition: %s", defaultTaskFamily)
+	s.Update("Registering Task definition: %s", prefix+defaultTaskFamily)
 
 	registerTaskDefinitionInput := ecs.RegisterTaskDefinitionInput{
 		ContainerDefinitions:    []*ecs.ContainerDefinition{&def},
 		ExecutionRoleArn:        aws.String(executionRoleArn),
 		Cpu:                     aws.String(i.config.CPU),
 		Memory:                  aws.String(i.config.Memory),
-		Family:                  aws.String(defaultTaskFamily),
+		Family:                  aws.String(prefix + defaultTaskFamily),
 		NetworkMode:             aws.String("awsvpc"),
 		RequiresCompatibilities: []*string{aws.String(defaultTaskRuntime)},
 		Tags: []*ecs.Tag{
@@ -293,7 +302,7 @@ func (i *ECSInstaller) Launch(
 		Cluster:                       &clusterName,
 		DesiredCount:                  aws.Int64(1),
 		LaunchType:                    aws.String(defaultTaskRuntime),
-		ServiceName:                   aws.String(serverName),
+		ServiceName:                   aws.String(prefix + serverName),
 		TaskDefinition:                aws.String(taskDefArn),
 		HealthCheckGracePeriodSeconds: aws.Int64(int64(600)),
 		NetworkConfiguration: &ecs.NetworkConfiguration{
@@ -311,12 +320,12 @@ func (i *ECSInstaller) Launch(
 		},
 		LoadBalancers: []*ecs.LoadBalancer{
 			{
-				ContainerName:  aws.String("waypoint-server"),
+				ContainerName:  aws.String(prefix + "waypoint-server"),
 				ContainerPort:  aws.Int64(int64(httpPort)),
 				TargetGroupArn: aws.String(nlb.httpTgArn),
 			},
 			{
-				ContainerName:  aws.String("waypoint-server"),
+				ContainerName:  aws.String(prefix + "waypoint-server"),
 				ContainerPort:  aws.Int64(int64(grpcPort)),
 				TargetGroupArn: aws.String(nlb.grpcTgArn),
 			},
@@ -328,7 +337,7 @@ func (i *ECSInstaller) Launch(
 		return nil, err
 	}
 
-	s.Update("Created ECS Service (%s, cluster-name: %s)", serviceName, clusterName)
+	s.Update("Created ECS Service (%s, cluster-name: %s)", prefix+serviceName, clusterName)
 	s.Done()
 	s = sg.Add("")
 	log.Debug("service started", "arn", service.ServiceArn)
@@ -428,7 +437,7 @@ func (i *ECSInstaller) Upgrade(
 	// list the services to find the task descriptions
 	services, err := ecsSvc.DescribeServices(&ecs.DescribeServicesInput{
 		Cluster:  aws.String(i.config.Cluster),
-		Services: []*string{aws.String(serverName)},
+		Services: []*string{aws.String(prefix + serverName)},
 	})
 	if err != nil {
 		return nil, err
@@ -906,7 +915,9 @@ func (i *ECSInstaller) InstallRunner(
 				return err
 			}
 
-			logGroup, err = i.SetupLogs(ctx, ui, log, sess, defaultRunnerLogGroup)
+			runnerLogGroup := fmt.Sprintf("%s-%s", i.config.Prefix, "runner-logs")
+
+			logGroup, err = i.SetupLogs(ctx, ui, log, sess, runnerLogGroup)
 			if err != nil {
 				return err
 			}
@@ -1063,6 +1074,14 @@ func (i *ECSInstaller) InstallFlags(set *flag.Set) {
 		Usage:   "Configures the requested memory amount for the Waypoint server task in ECS.",
 		Default: "1024",
 	})
+
+	set.StringVar(&flag.StringVar{
+		Name:    "prefix",
+		Target:  &i.config.Prefix,
+		Usage:   "Name prefix for AWS resources",
+		Default: "",
+	})
+
 }
 
 func (i *ECSInstaller) UpgradeFlags(set *flag.Set) {
@@ -1270,6 +1289,10 @@ func (i *ECSInstaller) SetupEFS(
 				Key:   aws.String(defaultServerTagName),
 				Value: aws.String(defaultServerTagValue),
 			},
+			{
+				Key:   aws.String("Name"),
+				Value: aws.String(prefix + "server-component"),
+			},
 		},
 	})
 	if err != nil {
@@ -1343,6 +1366,10 @@ EFSLOOP:
 			{
 				Key:   aws.String(defaultServerTagName),
 				Value: aws.String(defaultServerTagValue),
+			},
+			{
+				Key:   aws.String("Name"),
+				Value: aws.String(prefix + "server-component"),
 			},
 		},
 	})
@@ -1426,6 +1453,8 @@ func createSG(
 	ports []*int64,
 ) (*string, error) {
 	ec2srv := ec2.New(sess)
+
+	name = prefix + name
 
 	dsg, err := ec2srv.DescribeSecurityGroups(&ec2.DescribeSecurityGroupsInput{
 		Filters: []*ec2.Filter{
@@ -1703,7 +1732,7 @@ func createNLB(
 	elbsrv := elbv2.New(sess)
 
 	ctgGPRC, err := elbsrv.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
-		Name:                    aws.String("waypoint-server-grpc"),
+		Name:                    aws.String(prefix + "waypoint-server-grpc"),
 		Port:                    grpcPort,
 		Protocol:                aws.String("TCP"),
 		TargetType:              aws.String("ip"),
@@ -1722,7 +1751,7 @@ func createNLB(
 	}
 
 	htgGPRC, err := elbsrv.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
-		Name:                    aws.String("waypoint-server-http"),
+		Name:                    aws.String(prefix + "waypoint-server-http"),
 		Port:                    httpPort,
 		Protocol:                aws.String("TCP"),
 		TargetType:              aws.String("ip"),
@@ -1764,7 +1793,7 @@ func createNLB(
 	var lb *elbv2.LoadBalancer
 
 	dlb, err := elbsrv.DescribeLoadBalancers(&elbv2.DescribeLoadBalancersInput{
-		Names: []*string{aws.String(defaultNLBName)},
+		Names: []*string{aws.String(prefix + defaultNLBName)},
 	})
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
@@ -1784,12 +1813,12 @@ func createNLB(
 		s.Update("Using existing NLB %s (%s, dns-name: %s)",
 			defaultNLBName, *lb.LoadBalancerArn, *lb.DNSName)
 	} else {
-		s.Update("Creating new NLB: %s", defaultNLBName)
+		s.Update("Creating new NLB: %s", prefix+defaultNLBName)
 
 		scheme := elbv2.LoadBalancerSchemeEnumInternetFacing
 
 		clb, err := elbsrv.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
-			Name:    aws.String(defaultNLBName),
+			Name:    aws.String(prefix + defaultNLBName),
 			Subnets: subnets,
 			// SecurityGroups: []*string{sgWebId},
 			Scheme: &scheme,
@@ -1829,7 +1858,7 @@ func createNLB(
 			return nil, fmt.Errorf("failed to create NLB in time, last state: (%s)", *lb.State.Code)
 		}
 
-		s.Update("Created new NLB: %s (dns-name: %s)", defaultNLBName, *lb.DNSName)
+		s.Update("Created new NLB: %s (dns-name: %s)", prefix+defaultNLBName, *lb.DNSName)
 	}
 
 	s.Update("Creating new NLB Listener")
@@ -2024,7 +2053,7 @@ func (i *ECSInstaller) LaunchRunner(
 			aws.String("-vvv"),
 			aws.String("-liveness-tcp-addr=:1234"),
 		},
-		Name:  aws.String("waypoint-runner"),
+		Name:  aws.String(prefix + "waypoint-runner"),
 		Image: aws.String(i.config.ServerImage),
 		PortMappings: []*ecs.PortMapping{
 			{
@@ -2046,7 +2075,7 @@ func (i *ECSInstaller) LaunchRunner(
 		ExecutionRoleArn: aws.String(executionRoleArn),
 		Cpu:              aws.String(i.config.CPU),
 		Memory:           aws.String(i.config.Memory),
-		Family:           aws.String(runnerName),
+		Family:           aws.String(prefix + runnerName),
 
 		NetworkMode:             aws.String("awsvpc"),
 		RequiresCompatibilities: []*string{aws.String(defaultTaskRuntime)},
@@ -2074,7 +2103,7 @@ func (i *ECSInstaller) LaunchRunner(
 		Filters: []*ec2.Filter{
 			{
 				Name:   aws.String("group-name"),
-				Values: []*string{aws.String(defaultSecurityGroupName)},
+				Values: []*string{aws.String(prefix + defaultSecurityGroupName)},
 			},
 		},
 	})
@@ -2085,15 +2114,15 @@ func (i *ECSInstaller) LaunchRunner(
 	var groupId *string
 	if len(dsg.SecurityGroups) != 0 {
 		groupId = dsg.SecurityGroups[0].GroupId
-		s.Update("Using existing security group: %s", defaultSecurityGroupName)
+		s.Update("Using existing security group: %s", prefix+defaultSecurityGroupName)
 	} else {
-		return nil, fmt.Errorf("could not find security group (%s)", defaultSecurityGroupName)
+		return nil, fmt.Errorf("could not find security group (%s)", prefix+defaultSecurityGroupName)
 	}
 
 	// query what subnets and vpc information from the server service
 	services, err := ecsSvc.DescribeServices(&ecs.DescribeServicesInput{
 		Cluster:  aws.String(i.config.Cluster),
-		Services: []*string{aws.String(serverName)},
+		Services: []*string{aws.String(prefix + serverName)},
 	})
 	if err != nil {
 		return nil, err
@@ -2112,7 +2141,7 @@ func (i *ECSInstaller) LaunchRunner(
 		Cluster:        clusterArn,
 		DesiredCount:   aws.Int64(1),
 		LaunchType:     aws.String(defaultTaskRuntime),
-		ServiceName:    aws.String(runnerName),
+		ServiceName:    aws.String(prefix + runnerName),
 		TaskDefinition: aws.String(taskDefArn),
 		NetworkConfiguration: &ecs.NetworkConfiguration{
 			AwsvpcConfiguration: &ecs.AwsVpcConfiguration{
@@ -2129,7 +2158,7 @@ func (i *ECSInstaller) LaunchRunner(
 		},
 	}
 
-	s.Update("Creating ECS Service (%s)", runnerName)
+	s.Update("Creating ECS Service (%s)", prefix+runnerName)
 	svc, err := createService(createServiceInput, ecsSvc)
 	if err != nil {
 		return nil, err
